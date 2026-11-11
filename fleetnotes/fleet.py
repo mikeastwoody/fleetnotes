@@ -636,6 +636,27 @@ def outcome_line(result: FeedResult) -> str:
 # Reading the fleet (Firstmate's read-only view, as a child process)
 # ---------------------------------------------------------------------------
 
+class _ViewClock:
+    """The time a view read keeps: real time.
+
+    ``_run_view`` and ``_kill_group`` read the time and wait for the view only
+    through ``_clock``, so the tests can put a test clock there and get the same
+    result on a loaded machine as on an idle one.
+    """
+
+    @staticmethod
+    def monotonic() -> float:
+        return time.monotonic()
+
+    @staticmethod
+    def wait(proc: subprocess.Popen, seconds: float) -> bytes:
+        """The view's stdout once it ends; raises TimeoutExpired if it still runs after ``seconds``."""
+        return proc.communicate(timeout=seconds)[0]
+
+
+_clock = _ViewClock()
+
+
 def _run_view(argv: list[str], env: dict, cwd: str | None, timeout: float,
               should_stop: Callable[[], bool] | None, failed_exit: Callable[[int], str]) -> dict:
     """Run one fleet view to completion and return its JSON object.
@@ -648,17 +669,17 @@ def _run_view(argv: list[str], env: dict, cwd: str | None, timeout: float,
                                 stderr=subprocess.DEVNULL, cwd=cwd, env=env, start_new_session=True)
     except OSError as e:
         raise SnapshotError(f"could not start the fleet view ({e.__class__.__name__})") from None
-    deadline = time.monotonic() + timeout
+    deadline = _clock.monotonic() + timeout
     failure = None
     try:
         while True:
             try:
-                out, _ = proc.communicate(timeout=0.5)
+                out = _clock.wait(proc, 0.5)
                 break
             except subprocess.TimeoutExpired:
                 if should_stop is not None and should_stop():
                     failure = "read interrupted"
-                elif time.monotonic() >= deadline:
+                elif _clock.monotonic() >= deadline:
                     failure = f"the view took longer than {timeout:g} s"
                 if failure:
                     break
@@ -746,7 +767,7 @@ def _kill_group(proc: subprocess.Popen) -> None:
         except ProcessLookupError:
             break
         try:
-            proc.communicate(timeout=3)
+            _clock.wait(proc, 3)
             break
         except subprocess.TimeoutExpired:
             continue
