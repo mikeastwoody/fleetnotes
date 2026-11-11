@@ -1,0 +1,44 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests (overlay tests use the runner's Chrome)
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          FLEETNOTES_CHROME_ARGS: ${{ runner.os == 'Linux' && '--no-sandbox' || '' }}
+        run: python -m unittest discover -s tests -t . -v
+      - name: Install and smoke test
+        shell: bash
+        run: |
+          python -m pip install .
+          export HOME="$(mktemp -d)"
+          fleetnotes --version
+          fleetnotes add "Back in 5"
+          fleetnotes list | grep -q "Back in 5"

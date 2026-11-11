@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Never commit real notes, rules or secrets, even when output_dir or the
+# config point inside a checkout.
+config.toml
+rules.conf
+*.conf
+!examples/*.conf
+notes.json
+fleet.json
+salt
+off
+*.lock
+.env
+.env.*

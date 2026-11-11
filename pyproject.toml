@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fleetnotes"
+dynamic = ["version"]
+description = "Sticky notes for your live stream, plus a privacy-filtered ticker of what your Firstmate agent crew is doing."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Mike Eastwood" }]
+keywords = ["obs", "overlay", "streaming", "sticky-notes", "firstmate", "ai-agents", "live-coding"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Video :: Display",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/mikeastwoody/fleetnotes"
+Issues = "https://github.com/mikeastwoody/fleetnotes/issues"
+Changelog = "https://github.com/mikeastwoody/fleetnotes/blob/main/CHANGELOG.md"
+
+[project.scripts]
+fleetnotes = "fleetnotes.cli:run"
+
+[tool.setuptools]
+packages = ["fleetnotes"]
+
+[tool.setuptools.package-data]
+fleetnotes = ["overlay/*.html"]
+
+[tool.setuptools.dynamic]
+version = { attr = "fleetnotes.__version__" }

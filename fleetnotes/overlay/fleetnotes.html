@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=968, height=132">
+<title>fleetnotes</title>
+<!--
+  fleetnotes overlay (sticky-note style): a continuous ticker, like a TV news crawl.
+  Browser source of 968x132 at scale 1.0; the visible strip is 948x112 (a 10 px margin for the
+  corner radius and the shadow). Turn on "shutdown source when not visible".
+  The notes move from right to left, one after another and without end: each one with its whole
+  "who · what" sentence on one line (never cut: the ticker gives each note the width it needs) and
+  its state below; between notes, a diamond on a dark background. If all of them together do not
+  fill the strip they come round again, so there is never a gap. The anonymous fleet header
+  ("FIRSTMATE · 7 crewmates · 1 waiting") stays fixed on the left and the text passes behind it.
+  Every 5 s it reads two public files from its own folder:
+    notes.json  the captain's notes (fleetnotes add|pin|rm|...)        — fleetnotes-notes.v1
+    fleet.json  public projection of the fleet (fleetnotes fleet watch) — fleetnotes-feed.v1
+  New notes and changes of state or age enter with the next note, without jumps: the one already
+  crossing the strip finishes crossing. A captain's temporary note that expires (the overlay's own
+  clock expires it; it is still in notes.json) also finishes crossing, leaving no gap.
+  A note that leaves the data or that a newer one replaces (fleet deny, rm, clear, a new pinned or
+  temporary note, a task that leaves the feed, a "done!" after its 10 min), whose sentence changes
+  (fleet unlabel, fleet label) or whose state is no longer known leaves at the next read, even if
+  that leaves a gap; so do the fleet's notes when its feed is missing, unreadable or older than 180 s.
+  With no data, after "fleetnotes off" or with an unreadable notes.json it draws nothing.
+  textContent only, contract fields only. Browser-source rules (OBS's CEF on Apple Silicon):
+  no backdrop-filter, explicit px, 10 px between body and container, overflow visible.
+  Cost: only transform is animated (compositor animations, in 1 px steps so the text stays sharp);
+  JavaScript works once per note that enters, never per frame.
+  ?speed=N  speed in pixels per second (20-240, 60 by default: 1 px per frame at 60 fps).
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --ink: #2b211a;            /* text on paper */
+    --ink-soft: #5a4636;
+    --night: #1a1614;          /* dark background: dividers and header */
+    --gold: #f9dc7a;
+    --paper-yellow: #f9dc7a;   /* running / validating */
+    --paper-orange: #f6b784;   /* captain's note */
+    --paper-pink: #f5a7b5;     /* waiting on the captain */
+    --paper-lilac: #cdb8f2;    /* stuck */
+    --paper-mint: #a8e6b8;     /* done */
+    --paper-grey: #d9d4cc;     /* paused */
+    --shadow: 0 3px 7px rgba(0, 0, 0, 0.45), 0 1px 0 rgba(0, 0, 0, 0.18);  /* fits in the 10 px margin */
+  }
+
+  html, body { background: transparent !important; }
+
+  body {
+    width: 968px;
+    height: 132px;
+    padding: 10px;            /* room for border-radius and the shadow */
+    overflow: visible;
+    scrollbar-width: none;
+  }
+  ::-webkit-scrollbar { display: none; width: 0; height: 0; }
+
+  /* The ticker's window: notes enter on the right and leave on the left. */
+  .board {
+    position: relative;
+    width: 948px;
+    height: 112px;
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--night);
+    box-shadow: var(--shadow);
+    opacity: 0;
+    transition: opacity 0.4s ease;
+  }
+  .board.ready.filled { opacity: 1; }
+  .board:not(.filled) { box-shadow: none; }
+
+  /* One segment of the ticker: a note and the divider after it. A transform animation moves it. */
+  .seg {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: max-content;
+    height: 112px;
+    display: flex;
+    transform: translateX(948px);   /* off the strip until its animation places it */
+  }
+
+  .note {
+    position: relative;
+    flex: 1 0 auto;
+    height: 112px;
+    padding: 0 26px 0 30px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 4px;
+    background: var(--paper-yellow);
+    color: var(--ink);
+    white-space: nowrap;
+  }
+
+  /* sticky tape on the corner, folded over the previous divider */
+  .note::before {
+    content: "";
+    position: absolute;
+    top: 7px;
+    left: -9px;
+    width: 34px;
+    height: 11px;
+    background: rgba(255, 255, 255, 0.45);
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    transform: rotate(-38deg);
+  }
+
+  .note.kind-manual { background: var(--paper-orange); }
+  .note.state-needs_captain { background: var(--paper-pink); }
+  .note.state-problem { background: var(--paper-lilac); }
+  .note.state-done { background: var(--paper-mint); }
+  .note.state-paused { background: var(--paper-grey); }
+
+  /* a pin instead of tape on the pinned note */
+  .note.pinned::before {
+    top: 8px;
+    left: 9px;
+    width: 12px;
+    height: 12px;
+    border-radius: 6px;
+    border: none;
+    background: #d6453d;
+    box-shadow: 0 2px 3px rgba(0, 0, 0, 0.35), inset -2px -2px 0 rgba(0, 0, 0, 0.18);
+    transform: none;
+  }
+
+  /* The whole sentence on one line: the segment is as wide as the sentence. */
+  .sentence {
+    height: 30px;
+    font-family: 'Space Grotesk', system-ui, sans-serif;
+    font-weight: 600;
+    font-size: 24px;
+    line-height: 30px;
+  }
+  .sentence .who { font-weight: 700; }
+  .sentence .sep { color: var(--ink-soft); padding: 0 6px; }
+
+  .meta {
+    height: 18px;
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-weight: 600;
+    font-size: 15px;
+    line-height: 18px;
+    color: var(--ink-soft);
+  }
+
+  .dot {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 5px;
+    margin-right: 7px;
+    background: var(--ink-soft);
+    vertical-align: 1px;
+  }
+  .state-running .dot, .state-validating .dot { background: #2f9e44; animation: pulse 1.6s ease-in-out infinite; }
+  .state-needs_captain .dot { background: #c2255c; animation: pulse 1.1s ease-in-out infinite; }
+  .state-problem .dot { background: #6741d9; }
+  .state-done .dot { background: #2b8a3e; }
+
+  /* divider between notes: a dark band with a golden diamond */
+  .divider {
+    position: relative;
+    width: 44px;
+    height: 112px;
+    flex: 0 0 44px;
+    background: var(--night);
+  }
+  .divider::after {
+    content: "";
+    position: absolute;
+    left: 17px;
+    top: 51px;
+    width: 10px;
+    height: 10px;
+    background: var(--gold);
+    transform: rotate(45deg);
+  }
+
+  /* anonymous fleet header: fixed on the left; the ticker passes behind it */
+  .head {
+    position: absolute;
+    left: 0;
+    top: 0;
+    z-index: 5;
+    display: none;
+    max-width: 260px;
+    height: 112px;
+    padding: 0 16px 0 18px;
+    flex-direction: column;
+    justify-content: center;
+    gap: 2px;
+    background: var(--night);
+    box-shadow: 4px 0 10px rgba(0, 0, 0, 0.45);
+    color: var(--gold);
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  .head.on { display: flex; }
+  .head .title {
+    font-family: 'Space Grotesk', system-ui, sans-serif;
+    font-weight: 700;
+    font-size: 18px;
+    line-height: 22px;
+    letter-spacing: 1.5px;
+  }
+  .head .crew, .head .attn {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-weight: 600;
+    font-size: 14px;
+    line-height: 18px;
+  }
+  .head .attn { color: #ffb3c1; }
+
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+</style>
+</head>
+<body>
+  <div class="board" id="board"><div class="head" id="head"></div></div>
+
+<script>
+  // ---- Deterministic rules ---------------------------------------------------
+  const POLL_MS = 5000;         // how often the two files are read
+  const STALE_SECONDS = 180;    // an older fleet feed is not drawn (fails closed)
+  const DONE_VISIBLE_MIN = 10;  // a "done!" is celebrated for 10 min, then it goes
+  const BOARD_W = 948;          // width of the ticker's window
+  const HEAD_MAX = 260;         // px of the fixed header on the left
+  const LOOKAHEAD_MS = 4000;    // each note is prepared off the strip 4 s before it enters
+  const params = new URLSearchParams(location.search);
+  const SPEED = Math.min(240, Math.max(20, Number(params.get('speed')) || 60));   // px/s
+  const STEP_MS = 1000 / SPEED; // how long the ticker takes to move 1 px
+
+  // The feed's closed vocabulary -> the phrase the stream shows.
+  const PHRASE = {
+    running:       { ship: 'building', scout: 'researching', _: 'working' },
+    validating:    'validating',
+    needs_captain: 'waiting on the captain',
+    problem:       'stuck · firstmate is on it',
+    paused:        'paused',
+    done:          'done!'
+  };
+  const STEP = { review: 'review', test: 'tests', lint: 'lint', docs: 'docs',
+                 push: 'push', pr: 'PR', ci: 'CI', rebase: 'rebase' };
+  const RANK = { needs_captain: 1, problem: 2, done: 3, validating: 4, running: 5, paused: 6 };
+  const BROKEN = { broken: true };   // the file is there but cannot be read
+
+  const board = document.getElementById('board');
+  const head = document.getElementById('head');
+  board.dataset.speed = String(SPEED);
+
+  let items = [];          // what to show, already sanitised, in order
+  let known = new Map();   // what a segment already crossing may keep showing: "items" and the expired
+  let lastSignature = '';
+
+  // The ticker: live segments, in order of arrival. Each one starts to enter on the right
+  // just as the previous one is in whole, so only a note that leaves the data leaves a gap.
+  let lane = [];           // { seg, id, who, text, pos, start, w }
+  let nextStart = null;    // when (animation clock) the next segment starts to enter
+  let lastId = null;       // note of the last prepared segment and its position in "items"
+  let lastPos = -1;
+  let fillTimer = null;
+
+  async function readJson(name) {
+    let resp;
+    try { resp = await fetch(name + '?t=' + Date.now(), { cache: 'no-store' }); } catch (e) { return null; }
+    if (!resp.ok) return null;       // missing: no data
+    try {
+      const data = await resp.json();
+      return isObject(data) ? data : BROKEN;
+    } catch (e) { return BROKEN; }
+  }
+
+  // Own properties only: a "constructor" or "toString" state is not vocabulary.
+  function has(obj, key) { return typeof key === 'string' && Object.prototype.hasOwnProperty.call(obj, key); }
+  function isObject(v) { return v !== null && typeof v === 'object' && !Array.isArray(v); }
+  function isText(v) { return typeof v === 'string' && v.trim() !== ''; }
+  function count(v) { return Number.isInteger(v) && v > 0 ? v : 0; }
+  function time(iso) {
+    if (typeof iso !== 'string') return null;
+    const t = Date.parse(iso);
+    return Number.isFinite(t) ? t : null;
+  }
+  function minutesSince(iso, now) {
+    const t = time(iso);
+    return t === null ? null : Math.max(0, Math.floor((now - t) / 60000));
+  }
+  function humanAge(min) {
+    if (min < 60) return min + ' min';
+    const h = Math.floor(min / 60), m = min % 60;
+    return h + ' h ' + String(m).padStart(2, '0');
+  }
+  // One line: line breaks and repeated spaces count as one space. Never cut.
+  function squash(text) { return String(text).replace(/\s+/g, ' ').trim(); }
+
+  // Captain's notes: the newest pinned note and the newest temporary one not expired; apart, the
+  // ones the clock expired. An unreadable file or one of another schema counts as "fleetnotes off".
+  function manualView(manual, now) {
+    if (manual === null) return { off: false, notes: [], expired: [] };
+    if (manual === BROKEN || manual.schema !== 'fleetnotes-notes.v1' || manual.off === true) {
+      return { off: true, notes: [], expired: [] };
+    }
+    const until = m => (m.expires == null ? Infinity : time(m.expires));
+    const valid = (Array.isArray(manual.notes) ? manual.notes : [])
+      .filter(m => isObject(m) && isText(m.text) && until(m) !== null);
+    const live = valid.filter(m => until(m) > now);
+    const pinned = live.filter(m => m.pinned === true).slice(-1);
+    const temporary = live.filter(m => m.pinned !== true).slice(-1);
+    return { off: false, notes: pinned.concat(temporary), expired: valid.filter(m => until(m) <= now) };
+  }
+
+  function fleetView(feed, now) {
+    const none = { notes: [], summary: null };
+    if (!feed || feed === BROKEN || feed.schema !== 'fleetnotes-feed.v1') return none;
+    const generated = time(feed.generated);
+    const age = generated === null ? NaN : (now - generated) / 1000;
+    if (!(age >= 0 && age <= STALE_SECONDS)) return none;
+    const recentlyDone = n => { const m = minutesSince(n.changed, now); return m !== null && m <= DONE_VISIBLE_MIN; };
+    const usable = (Array.isArray(feed.notes) ? feed.notes : [])
+      .filter(n => isObject(n) && has(RANK, n.state) && isText(n.project))
+      .filter(n => n.state !== 'done' || recentlyDone(n));
+    usable.sort((a, b) => (RANK[a.state] - RANK[b.state]) || ((time(b.changed) || 0) - (time(a.changed) || 0)));
+    return { notes: usable, summary: isObject(feed.summary) ? feed.summary : null };
+  }
+
+  // Header: anonymous counts of the whole fleet (also the tasks shown without a name).
+  // Variants from the longest to the shortest: the first that fits is used.
+  function headerVariants(sm) {
+    if (!sm) return null;
+    const total = ['running', 'validating', 'needs_captain', 'problem', 'paused']
+      .reduce((acc, k) => acc + count(sm[k]), 0);
+    if (!total) return null;
+    const waiting = count(sm.needs_captain), stuck = count(sm.problem);
+    const attn = [];
+    if (waiting) attn.push(waiting + ' waiting');
+    if (stuck) attn.push(stuck + ' stuck');
+    return [{ crew: total + (total > 1 ? ' crewmates' : ' crewmate'), attn },
+            { crew: total + ' crew', attn }];
+  }
+
+  function metaFor(n, now) {
+    let phrase = PHRASE[n.state];
+    if (typeof phrase === 'object') phrase = has(phrase, n.kind) ? phrase[n.kind] : phrase._;
+    if (n.state === 'validating') {
+      if (Number.isInteger(n.total) && n.total > 0 && Number.isInteger(n.position)) {
+        phrase += ' ' + n.position + '/' + n.total;
+      }
+      if (has(STEP, n.step)) phrase += ' · ' + STEP[n.step];
+    }
+    if (n.state === 'paused' || n.state === 'problem') return phrase;
+    const ref = (n.state === 'running' || n.state === 'validating') ? n.started : n.changed;
+    const age = minutesSince(ref, now);
+    if (age === null) return phrase;
+    if (n.state === 'done') return phrase + ' · ' + (age < 1 ? 'just now' : humanAge(age) + ' ago');
+    return age < 1 ? phrase : phrase + ' · ' + humanAge(age);
+  }
+
+  // What to draw, already sanitised: plain text and closed vocabulary. "expired": the captain's
+  // notes the clock alone expired; their segments already crossing the strip finish crossing.
+  function buildView(manual, fleet, now) {
+    const own = manualView(manual, now);
+    if (own.off) return { head: null, items: [], expired: [] };
+    const used = new Set();
+    const uniqueId = id => { let u = id, i = 2; while (used.has(u)) u = id + '#' + i++; used.add(u); return u; };
+    const mine = (m, i) => ({
+      id: uniqueId('m:' + (isText(m.key) ? m.key : i)),
+      cls: 'note kind-manual' + (m.pinned === true ? ' pinned' : ''),
+      who: null, text: squash(m.text), meta: "captain's note", dot: false });
+    const theirs = (n, i) => ({
+      id: uniqueId('f:' + (isText(n.key) ? n.key : i)), cls: 'note state-' + n.state,
+      who: squash(isText(n.who) ? n.who : n.project),
+      text: isText(n.label) ? squash(n.label) : 'a crewmate at work',
+      meta: metaFor(n, now), dot: true });
+    const f = fleetView(fleet, now);
+    const items = own.notes.map(mine).concat(f.notes.map(theirs));
+    return { head: headerVariants(f.summary), items, expired: own.expired.map(mine) };
+  }
+
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;   // never innerHTML
+    return node;
+  }
+
+  function fitHead(variants) {
+    head.textContent = '';
+    head.classList.toggle('on', Boolean(variants));   // visible first: a hidden one measures 0
+    for (const v of variants || []) {
+      head.textContent = '';
+      head.append(el('div', 'title', 'FIRSTMATE'), el('div', 'crew', v.crew));
+      for (const line of v.attn) head.append(el('div', 'attn', line));
+      if (head.scrollWidth <= HEAD_MAX) break;
+    }
+  }
+
+  // Visible left edge: the fixed header's, if there is one.
+  function windowLeft() { return head.classList.contains('on') ? head.offsetWidth : 0; }
+
+  // A new segment, off the strip on the right; measured once, when it is made.
+  function makeSegment(v) {
+    const seg = el('div', 'seg');
+    const note = el('div', v.cls);
+    const sentence = el('div', 'sentence');
+    if (v.who) sentence.append(el('span', 'who', v.who), el('span', 'sep', '·'));
+    sentence.append(el('span', 'what', v.text));
+    const meta = el('div', 'meta');
+    if (v.dot) meta.append(el('span', 'dot'));
+    meta.append(el('span', 'text', v.meta));
+    note.append(sentence, meta);
+    seg.append(note, el('div', 'divider'));
+    board.appendChild(seg);
+    const w = Math.max(1, Math.ceil(seg.getBoundingClientRect().width));
+    seg.style.width = w + 'px';      // fixed: if the font changes later, the ticker stays aligned
+    // Measured for the tests: the sentence on one line and nothing cut.
+    if (sentence.scrollHeight > 31 || note.scrollWidth > note.clientWidth + 1) note.dataset.overflow = '1';
+    return { seg, w };
+  }
+
+  // Crosses the strip from right to left at SPEED px/s, in 1 px steps (sharp text), with a start
+  // set on the animation clock: the compositor moves it without going through JavaScript.
+  function launch(seg, w, start) {
+    const dist = BOARD_W + w;
+    const anim = seg.animate(
+      [{ transform: 'translateX(' + BOARD_W + 'px)' }, { transform: 'translateX(' + (-w) + 'px)' }],
+      { duration: dist * STEP_MS, easing: 'steps(' + dist + ', end)', fill: 'both' });
+    anim.startTime = start;
+    seg.dataset.start = start.toFixed(3);
+    seg.dataset.w = String(w);
+  }
+
+  function clock() {
+    const t = document.timeline.currentTime;
+    return typeof t === 'number' ? t : performance.now();
+  }
+
+  // The note after the last segment's; if that one is gone, the one now in its place.
+  function nextPos() {
+    if (lastId === null) return 0;
+    const i = items.findIndex(v => v.id === lastId);
+    if (i >= 0) return (i + 1) % items.length;
+    return lastPos >= 0 && lastPos < items.length ? lastPos : 0;
+  }
+
+  function dropLane() {
+    for (const s of lane) s.seg.remove();
+    lane = [];
+    nextStart = null;
+  }
+
+  // When a segment has just left on the left.
+  function exitAt(s) { return s.start + (BOARD_W + s.w) * STEP_MS; }
+
+  // Keeps the ticker full: prepares segments up to LOOKAHEAD_MS ahead and removes the ones that left.
+  function fill() {
+    clearTimeout(fillTimer);
+    fillTimer = null;
+    const now = clock();
+    while (lane.length && exitAt(lane[0]) <= now) lane.shift().seg.remove();
+    if (!items.length) {
+      // Nothing more to show: what is still crossing finishes crossing, then the strip goes dark.
+      if (!lane.length) { clearBoard(); return; }
+      fillTimer = setTimeout(fill, exitAt(lane[lane.length - 1]) - now + 50);
+      return;
+    }
+    // After a long pause (a frozen page) the strip would be empty: it is filled whole again.
+    if (nextStart !== null && now - nextStart > BOARD_W * STEP_MS) dropLane();
+    if (nextStart === null) {
+      // The first note already in place, at the visible left edge: the strip appears full.
+      // Half a step of offset: the 1 px steps fall between frames, not on them.
+      nextStart = now - (BOARD_W - windowLeft()) * STEP_MS + STEP_MS / 2;
+    }
+    for (let guard = 0; nextStart <= now + LOOKAHEAD_MS && guard < 64; guard++) {
+      const pos = nextPos();
+      const v = items[pos];
+      const { seg, w } = makeSegment(v);
+      launch(seg, w, nextStart);
+      lane.push({ seg, id: v.id, who: v.who, text: v.text, pos, start: nextStart, w });
+      nextStart += w * STEP_MS;
+      lastId = v.id;
+      lastPos = pos;
+    }
+    board.dataset.now = now.toFixed(3);
+    board.classList.add('filled');
+    fillTimer = setTimeout(fill, Math.max(100, nextStart - LOOKAHEAD_MS - now + 50));
+  }
+
+  function clearBoard() {
+    clearTimeout(fillTimer);
+    fillTimer = null;
+    dropLane();
+    lastId = null;
+    lastPos = -1;
+    board.classList.remove('filled');
+  }
+
+  // Applies new data: what has not entered yet is prepared again with it, and what is already
+  // crossing the strip finishes crossing if its note is still in the data with the same sentence (a
+  // new state or age waits for the next round, and a temporary note that expires leaves no gap).
+  // A note that leaves the data or changes its sentence leaves at once (fails closed), even if
+  // that leaves a gap that passes by: so do the notes of a feed that stopped being valid.
+  function apply() {
+    const now = clock();
+    const keep = [];
+    let resume = null;
+    for (const s of lane) {
+      const queued = s.start > now;
+      const v = known.get(s.id);
+      if (queued || !v || v.who !== s.who || v.text !== s.text) {
+        s.seg.remove();
+        if (queued && resume === null) resume = s.start;
+      } else {
+        keep.push(s);
+      }
+    }
+    lane = keep;
+    const last = keep[keep.length - 1];
+    lastId = last ? last.id : null;
+    lastPos = last ? last.pos : -1;
+    if (!keep.length) nextStart = null;          // nothing on screen: fill it whole again
+    else nextStart = resume !== null ? resume : Math.max(nextStart, now + STEP_MS / 2);
+    fill();
+  }
+
+  function render(manual, fleet, now) {
+    const view = buildView(manual, fleet, now);
+    const signature = JSON.stringify(view);
+    if (signature === lastSignature) return;
+    lastSignature = signature;
+    items = view.items;
+    known = new Map(view.items.concat(view.expired).map(v => [v.id, v]));
+    fitHead(items.length ? view.head : null);
+    apply();
+  }
+
+  async function tick() {
+    const [manual, fleet] = await Promise.all([readJson('notes.json'), readJson('fleet.json')]);
+    try {
+      render(manual, fleet, Date.now());
+    } catch (e) {
+      items = [];
+      lastSignature = '';
+      fitHead(null);
+      clearBoard();                   // any odd data: draw nothing
+    }
+  }
+
+  // It appears only once the fonts and the first read are ready (no font flash).
+  // fonts.ready does not wait for fonts the page has not asked for yet: they are asked for here, 3 s at most.
+  const FONTS = ['600 24px "Space Grotesk"', '700 24px "Space Grotesk"', '700 18px "Space Grotesk"',
+                 '600 15px "JetBrains Mono"'];
+  Promise.race([Promise.all(FONTS.map(f => document.fonts.load(f))),
+                new Promise(resolve => setTimeout(resolve, 3000))])
+    .catch(() => {}).then(tick).catch(() => {}).finally(() => board.classList.add('ready'));
+  // If a font arrives late, the segments that have not entered yet are measured again with it.
+  document.fonts.addEventListener('loadingdone', () => { if (items.length) apply(); });
+  setInterval(tick, POLL_MS);
+</script>
+</body>
+</html>

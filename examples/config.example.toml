@@ -1,0 +1,39 @@
+# fleetnotes config — copy to ~/.config/fleetnotes/config.toml (or point
+# FLEETNOTES_CONFIG / --config at it). Every key is optional; the values
+# below are the defaults unless the comment says otherwise. No secrets go
+# here: fleetnotes needs none.
+
+# Where the overlay's two public files (notes.json, fleet.json) are written.
+# `fleetnotes serve` serves them; anything you put here may end up on stream.
+# output_dir = "~/.local/share/fleetnotes/public"
+
+# Private files: lock, the salt of the opaque task keys, the `off` switch.
+# state_dir = "~/.local/state/fleetnotes"
+
+# Private fleet rules (allowlist, labels, block lines). Relative paths are
+# relative to this file's folder. Keep it out of any repository.
+# rules_file = "rules.conf"
+
+# Extra phrases no public text may contain (case-insensitive substrings),
+# on top of the built-in rules. Example (not a default):
+blocked_phrases = ["Billing", "Admin console", "Payroll"]
+
+[serve]
+# Loopback only: your streaming software runs on this computer.
+host = "127.0.0.1"
+port = 8765
+
+[fleet]
+# The optional Firstmate feed. Empty (the default) turns it off; set it to
+# your Firstmate home to enable `fleetnotes fleet watch` and `fleet plan`.
+firstmate_home = ""
+# firstmate_home = "~/firstmate"
+refresh_seconds = 60     # 5-90: how often the feed is rebuilt
+snapshot_timeout = 45    # 5-60: the whole read gives up after this
+
+# Up to 4 other machines whose Firstmate home is read over ssh (BatchMode:
+# key-based, never a password prompt; the remote view writes nothing there).
+# [[fleet.remotes]]
+# name = "Studio Mac"            # public: shown as "Studio Mac: <project> · ..."
+# host = "studio"                # ssh destination or ~/.ssh/config alias
+# home = "/Users/you/firstmate"  # absolute path of that machine's Firstmate home
