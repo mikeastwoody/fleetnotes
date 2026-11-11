@@ -52,7 +52,7 @@ The public projection of a Firstmate fleet, written by `fleetnotes fleet watch`.
 | `notes` | At most 10, ordered by state (`needs_captain`, `problem`, `done`, `validating`, `running`, `paused`), newest change first. |
 | `key` | HMAC-SHA256 of the task id with a local salt, first 10 hex characters. Stable, opaque. |
 | `project` | The allowlisted public name (up to 16 characters). |
-| `who` | `project`, `"Secondmate of <project>"` or `"<machine>: <project>"`; always ends with `project`. |
+| `who` | `project`, `"Secondmate of <project>"` or `"<machine>: <project>"`; always ends with `project`. The words `Secondmate of ` are a fixed English form, not display text: a writer must not translate them, and a reader may show them in its own language (see below). |
 | `label`, `label_from` | What the task does: the approved label (`"label"`), the cleaned backlog title (`"title"`), or `null`/`null` when nothing public is left. Up to 60 characters. |
 | `kind` | `ship` or `scout`. |
 | `state` | `running`, `validating`, `needs_captain`, `problem`, `paused` or `done` (shown for 10 minutes). |
@@ -61,3 +61,7 @@ The public projection of a Firstmate fleet, written by `fleetnotes fleet watch`.
 | `started`, `changed` | UTC times of the crewmate's spawn and of its last status event, or `null`. |
 
 Task ids, backlog text, status messages, paths, pull requests, secondmate ids and ssh hosts are read only to decide what to publish; they never appear in this file.
+
+### Languages
+
+The feed is the same whatever language the overlay shows: its vocabulary (`state`, `step`, `kind`) is closed and the overlay turns it into phrases. With `?lang=es` the overlay shows a `who` that is exactly `"Secondmate of " + project` as `"El secondmate de " + project`. Any other `who`, such as `"<machine>: <project>"` or a project whose public name itself starts with those words, is shown as it is. Since 0.2.0 depends on no new key, a 0.1.0 overlay or `validate_feed` still reads a 0.2.0 feed, and the other way round.

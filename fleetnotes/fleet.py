@@ -87,6 +87,8 @@ NOTE_KEYS = frozenset({"key", "project", "who", "label", "label_from", "kind", "
 REQUIRED_NOTE_KEYS = frozenset({"key", "project", "who", "label", "label_from", "kind", "state",
                                 "started", "changed"})
 
+# A fixed form of the contract, never translated here: the overlay with ?lang=es shows
+# "Secondmate of <project>" as "El secondmate de <project>" (docs/contracts.md).
 SECONDMATE_PREFIX = "Secondmate of "
 WHO_MAX = max(len(SECONDMATE_PREFIX) + PROJECT_MAX, PROJECT_MAX + len(": ") + PROJECT_MAX)  # 34
 IDLE_TEXT = "a crewmate at work"

@@ -36,6 +36,8 @@ In OBS, add a **Browser** source:
 
 The note appears within five seconds. To change the scrolling speed, add `?speed=120` to the URL (20 to 240 pixels per second; the default is 60).
 
+To show the overlay in Spanish, add `?lang=es` (with a speed too: `?speed=120&lang=es`). The phrases, the header and the ages change, for example "El secondmate de Driftwood · Slack integration — espera al capitán · 4 min" and "FIRSTMATE · 7 crewmates · 1 espera". Your notes and the task labels are shown as you wrote them. Without the parameter, or with any other value, the overlay is in English.
+
 ## Captain's notes
 
 ```sh
