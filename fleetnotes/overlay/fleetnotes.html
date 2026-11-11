@@ -29,6 +29,8 @@
   Cost: only transform is animated (compositor animations, in 1 px steps so the text stays sharp);
   JavaScript works once per note that enters, never per frame.
   ?speed=N  speed in pixels per second (20-240, 60 by default: 1 px per frame at 60 fps).
+  ?lang=es  every visible text in Spanish ("El secondmate de Driftwood", "espera al capitán"); without
+            it, or with any other value, English. The data and the feed stay the same.
 -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -239,17 +241,60 @@
   const SPEED = Math.min(240, Math.max(20, Number(params.get('speed')) || 60));   // px/s
   const STEP_MS = 1000 / SPEED; // how long the ticker takes to move 1 px
 
-  // The feed's closed vocabulary -> the phrase the stream shows.
-  const PHRASE = {
-    running:       { ship: 'building', scout: 'researching', _: 'working' },
-    validating:    'validating',
-    needs_captain: 'waiting on the captain',
-    problem:       'stuck · firstmate is on it',
-    paused:        'paused',
-    done:          'done!'
+  // Every text the stream shows, in its language: English, or Spanish with ?lang=es.
+  // phrase: the feed's closed vocabulary -> the phrase the stream shows; step: a validation step;
+  // secondmate: what replaces the feed's fixed "Secondmate of " before a project (fleetnotes-feed.v1).
+  const TEXTS = {
+    en: {
+      phrase: {
+        running:       { ship: 'building', scout: 'researching', _: 'working' },
+        validating:    'validating',
+        needs_captain: 'waiting on the captain',
+        problem:       'stuck · firstmate is on it',
+        paused:        'paused',
+        done:          'done!'
+      },
+      step: { review: 'review', test: 'tests', lint: 'lint', docs: 'docs',
+              push: 'push', pr: 'PR', ci: 'CI', rebase: 'rebase' },
+      secondmate: 'Secondmate of ',
+      idle: 'a crewmate at work',
+      captain: "captain's note",
+      justNow: 'just now',
+      ago: age => age + ' ago',
+      crew: n => n + (n > 1 ? ' crewmates' : ' crewmate'),
+      waiting: n => n + ' waiting',
+      stuck: n => n + ' stuck',
+      short: null
+    },
+    es: {
+      phrase: {
+        running:       { ship: 'construyendo', scout: 'investigando', _: 'trabajando' },
+        validating:    'validando',
+        needs_captain: 'espera al capitán',
+        problem:       'atascado · lo revisa firstmate',
+        paused:        'en pausa',
+        done:          '¡listo!'
+      },
+      step: { review: 'revisión', test: 'tests', lint: 'lint', docs: 'docs',
+              push: 'push', pr: 'PR', ci: 'CI', rebase: 'rebase' },
+      secondmate: 'El secondmate de ',
+      idle: 'un crewmate en marcha',
+      captain: 'nota del capitán',
+      justNow: 'ahora',
+      ago: age => 'hace ' + age,
+      crew: n => n + (n > 1 ? ' crewmates' : ' crewmate'),
+      waiting: n => n + (n > 1 ? ' esperan' : ' espera'),
+      stuck: n => n + (n > 1 ? ' atascados' : ' atascado'),
+      // the longer words leave less room for the counts: one more, shorter header for huge ones
+      short: { waiting: n => n + ' esp.', stuck: n => n + ' atasc.' }
+    }
   };
-  const STEP = { review: 'review', test: 'tests', lint: 'lint', docs: 'docs',
-                 push: 'push', pr: 'PR', ci: 'CI', rebase: 'rebase' };
+  const LANG = params.get('lang') === 'es' ? 'es' : 'en';
+  const T = TEXTS[LANG];
+  const FEED_SECONDMATE = 'Secondmate of ';   // the feed's own words (fleet.SECONDMATE_PREFIX), never translated there
+  const PHRASE = T.phrase;
+  const STEP = T.step;
+  document.documentElement.lang = LANG;
   const RANK = { needs_captain: 1, problem: 2, done: 3, validating: 4, running: 5, paused: 6 };
   const BROKEN = { broken: true };   // the file is there but cannot be read
 
@@ -339,11 +384,18 @@
       .reduce((acc, k) => acc + count(sm[k]), 0);
     if (!total) return null;
     const waiting = count(sm.needs_captain), stuck = count(sm.problem);
-    const attn = [];
-    if (waiting) attn.push(waiting + ' waiting');
-    if (stuck) attn.push(stuck + ' stuck');
-    return [{ crew: total + (total > 1 ? ' crewmates' : ' crewmate'), attn },
-            { crew: total + ' crew', attn }];
+    const lines = words => [waiting && words.waiting(waiting), stuck && words.stuck(stuck)].filter(Boolean);
+    const attn = lines(T);
+    const variants = [{ crew: T.crew(total), attn }, { crew: total + ' crew', attn }];
+    if (T.short) variants.push({ crew: total + ' crew', attn: lines(T.short) });
+    return variants;
+  }
+
+  // Who does the work: the feed's "Secondmate of <project>" in the overlay's language.
+  function whoFor(n) {
+    const who = squash(isText(n.who) ? n.who : n.project);
+    const project = isText(n.project) ? squash(n.project) : '';
+    return project && who === FEED_SECONDMATE + project ? T.secondmate + project : who;
   }
 
   function metaFor(n, now) {
@@ -359,7 +411,7 @@
     const ref = (n.state === 'running' || n.state === 'validating') ? n.started : n.changed;
     const age = minutesSince(ref, now);
     if (age === null) return phrase;
-    if (n.state === 'done') return phrase + ' · ' + (age < 1 ? 'just now' : humanAge(age) + ' ago');
+    if (n.state === 'done') return phrase + ' · ' + (age < 1 ? T.justNow : T.ago(humanAge(age)));
     return age < 1 ? phrase : phrase + ' · ' + humanAge(age);
   }
 
@@ -373,11 +425,11 @@
     const mine = (m, i) => ({
       id: uniqueId('m:' + (isText(m.key) ? m.key : i)),
       cls: 'note kind-manual' + (m.pinned === true ? ' pinned' : ''),
-      who: null, text: squash(m.text), meta: "captain's note", dot: false });
+      who: null, text: squash(m.text), meta: T.captain, dot: false });
     const theirs = (n, i) => ({
       id: uniqueId('f:' + (isText(n.key) ? n.key : i)), cls: 'note state-' + n.state,
-      who: squash(isText(n.who) ? n.who : n.project),
-      text: isText(n.label) ? squash(n.label) : 'a crewmate at work',
+      who: whoFor(n),
+      text: isText(n.label) ? squash(n.label) : T.idle,
       meta: metaFor(n, now), dot: true });
     const f = fleetView(fleet, now);
     const items = own.notes.map(mine).concat(f.notes.map(theirs));

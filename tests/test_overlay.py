@@ -45,7 +45,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from fleetnotes.fleet import WHO_MAX, build_feed
+from fleetnotes.fleet import SECONDMATE_PREFIX, WHO_MAX, Source, build_feed
 from fleetnotes.notes import FLEET_FILENAME, LABEL_MAX, MANUAL_FILENAME, NOTE_MAX, iso_utc, parse_rules, text_width
 from fleetnotes.server import OVERLAY_FILENAME, overlay_path
 
@@ -388,6 +388,69 @@ LONG_SENTENCES = [f"{n['who']} · {n['label']}" for n in LONG]
 WIDEST = note("a6", "running", "FULL MIGRATION OF THE WIDGET AND LIVE ACTIVITY TO THE ISLE",
               project="HarborWatchAppXY", who="Studio Mac Spare: HarborWatchAppXY")
 
+# Every state and phrase, with the sentence and state line the ticker shows in English and with ?lang=es,
+# in the order the overlay sorts them (state, then newest change first).
+ALL_STATES = [
+    (note("b1", "needs_captain", "first-run screen", project="Driftwood", who="Secondmate of Driftwood",
+          changed=120),
+     "Secondmate of Driftwood · first-run screen waiting on the captain · 2 min",
+     "El secondmate de Driftwood · first-run screen espera al capitán · 2 min"),
+    (note("b2", "needs_captain", None, changed=300),
+     "Lighthouse · a crewmate at work waiting on the captain · 5 min",
+     "Lighthouse · un crewmate en marcha espera al capitán · 5 min"),
+    (note("b3", "problem", "stuck job"),
+     "Lighthouse · stuck job stuck · firstmate is on it",
+     "Lighthouse · stuck job atascado · lo revisa firstmate"),
+    (note("b4", "done", "finished job", changed=30),
+     "Lighthouse · finished job done! · just now",
+     "Lighthouse · finished job ¡listo! · ahora"),
+    (note("b5", "done", "older finished job", project="Tidepool", who="Studio Mac: Tidepool", changed=300),
+     "Studio Mac: Tidepool · older finished job done! · 5 min ago",
+     "Studio Mac: Tidepool · older finished job ¡listo! · hace 5 min"),
+    (note("b6", "validating", "checked job", step="test", position=2, total=3),
+     "Lighthouse · checked job validating 2/3 · tests · 18 min",
+     "Lighthouse · checked job validando 2/3 · tests · 18 min"),
+    (note("b7", "validating", "reviewed job", step="review", changed=400),
+     "Lighthouse · reviewed job validating · review · 18 min",
+     "Lighthouse · reviewed job validando · revisión · 18 min"),
+    (note("b8", "running", "ship job"),
+     "Lighthouse · ship job building · 18 min",
+     "Lighthouse · ship job construyendo · 18 min"),
+    (note("b9", "running", "scouting job", kind="scout", started=120, changed=400, project="Ab",
+          who="Secondmate of Ab"),
+     "Secondmate of Ab · scouting job researching · 2 min",
+     "El secondmate de Ab · scouting job investigando · 2 min"),
+    (note("b10", "running", "odd job", kind="other", started=3900, changed=500),
+     "Lighthouse · odd job working · 1 h 05",
+     "Lighthouse · odd job trabajando · 1 h 05"),
+    (note("b11", "paused", "resting job"),
+     "Lighthouse · resting job paused",
+     "Lighthouse · resting job en pausa"),
+]
+ALL_STATES_SUMMARY = {"running": 3, "validating": 2, "needs_captain": 2, "problem": 1, "paused": 1,
+                      "done_recent": 2}
+# Three notes per board: a segment leaves the board once it has crossed the strip, so a longer list
+# is never on it whole. The captain's note leads the first board.
+STATE_GROUPS = [ALL_STATES[i:i + 3] for i in range(0, len(ALL_STATES), 3)]
+
+SECONDMATE_ES = "El secondmate de "
+# The longest sentences with ?lang=es: the Spanish "who" of a secondmate with the widest project, the
+# widest remote "who" and 60-character labels with accents.
+LONG_ES = [
+    note("e1", "needs_captain", "plan Starter de hasta 3 proyectos y aviso a administración…",
+         project="DriftwoodKitPls1", who="Secondmate of DriftwoodKitPls1", changed=3900),
+    note("e2", "validating", "la versión 23 de prueba con el contador por app y su widget…",
+         project="Tidepool", who="Studio Mac: Tidepool", step="review", position=12, total=14),
+    note("e3", "done", "integración completa con Slack, Discord y Teams y avisos ÁÉÍ",
+         project="HarborWatchAppXY", who="Studio Mac Plus: HarborWatchAppXY", changed=300),
+    note("e4", "problem", "el bot del chat responde dudas con el modelo local de prueba",
+         project="HarborWatchAppXY", who="Secondmate of HarborWatchAppXY"),
+    note("e5", "running", "pantallas nuevas de bienvenida para el iPhone y para el iPad", kind="scout",
+         started=3900, project="HarborWatchAppXY", who="Secondmate of HarborWatchAppXY"),
+]
+WIDEST_ES = note("e6", "paused", "LA MIGRACIÓN COMPLETA DEL WIDGET Y LA ACTIVIDAD EN DIRECTO",
+                 project="HarborWatchAppXY", who="Studio Mac Spare: HarborWatchAppXY")
+
 BOARD = re.compile(r'<div class="board([^"]*)" id="board"([^>]*)>(.*?)</div>\s*<script>', re.S)
 SEGMENT = re.compile(r'<div class="seg"([^>]*)>(.*?)<div class="divider"></div></div>', re.S)
 
@@ -414,10 +477,11 @@ class OverlayTest(unittest.TestCase):
     def tearDown(self):
         _QuietHandler.sequences.clear()
 
-    def render(self, manual=None, feed=None, budget_ms=3000, query="", until=None) -> str:
+    def render(self, manual=None, feed=None, budget_ms=3000, query="", until=None, probe=None) -> str:
         """Inner HTML of the board after ``budget_ms`` of test time (first poll at 0). With ``until``, a
         test of the board's inner HTML, it stops at the first moment the test holds instead, and
-        ``budget_ms`` is only the limit."""
+        ``budget_ms`` is only the limit. ``probe``, an expression, is evaluated in the page at that
+        moment into ``self.probed``; the page's language goes into ``self.lang``."""
         for name, data in ((MANUAL_FILENAME, manual), (FLEET_FILENAME, feed)):
             path = os.path.join(self.root, name)
             if data is None:
@@ -437,6 +501,8 @@ class OverlayTest(unittest.TestCase):
         with Chrome(self.url + query, NOW * 1000) as chrome:
             chrome.run(budget_ms, until and board_holds)
             out = chrome.html()
+            self.lang = chrome.evaluate("document.documentElement.lang")
+            self.probed = chrome.evaluate(probe) if probe else None
         match = BOARD.search(out)
         self.assertIsNotNone(match, "board not found in the page")
         self.assertIn("ready", match.group(1))  # the first poll finished, whatever the data
@@ -779,6 +845,152 @@ class OverlayTest(unittest.TestCase):
         self.assertEqual(self.head(board), "FIRSTMATE 1 crewmate")
         self.assertIn("Lighthouse · notes with concrete sentences building · 25 min", self.text(board))
         self.assertNotIn("kumquat", self.text(board))
+
+    # -- ?lang=es -------------------------------------------------------------------------------
+
+    def state_boards(self, query=""):
+        """The boards of STATE_GROUPS at 240 px/s (the captain's note leads the first) and the texts of
+        their segments, in order, once each board has all of its notes."""
+        boards, texts = [], []
+        for i, group in enumerate(STATE_GROUPS):
+            manual = pinned("Pinned of the day") if i == 0 else None
+            n = len(group) + (manual is not None)
+            board = self.render(manual, fleet([g[0] for g in group], ALL_STATES_SUMMARY), budget_ms=20_000,
+                                query="?speed=240" + query, until=lambda b: len(self.segments(b)) >= n)
+            segs = self.assertTicker(board, left=HEAD_MAX)
+            boards.append(board)
+            texts += [s["text"] for s in segs[:n]]
+        return boards, texts
+
+    def test_english_by_default_and_for_any_other_lang(self):
+        boards, texts = self.state_boards()
+        self.assertEqual(self.lang, "en")
+        self.assertEqual(self.head(boards[0]), "FIRSTMATE 9 crewmates 2 waiting 1 stuck")
+        self.assertEqual(texts, ["Pinned of the day captain's note", *(en for _, en, _ in ALL_STATES)])
+        manual, group = pinned("Pinned of the day"), fleet([g[0] for g in STATE_GROUPS[0]], ALL_STATES_SUMMARY)
+        n = len(STATE_GROUPS[0]) + 1
+        for query in ("&lang=en", "&lang=ES", "&lang=es-MX", "&lang=", "&lang=fr", "&LANG=es"):
+            with self.subTest(query=query):
+                other = self.render(manual, group, budget_ms=20_000, query="?speed=240" + query,
+                                    until=lambda b: len(self.segments(b)) >= n)
+                self.assertEqual(self.lang, "en")
+                self.assertEqual(other, boards[0])      # the very same board, to the pixel
+
+    def test_spanish_states_phrases_and_header(self):
+        boards, texts = self.state_boards("&lang=es")
+        self.assertEqual(self.lang, "es")
+        self.assertEqual(self.head(boards[0]), "FIRSTMATE 9 crewmates 2 esperan 1 atascado")
+        self.assertEqual(texts, ["Pinned of the day nota del capitán", *(es for _, _, es in ALL_STATES)])
+        for board in boards:
+            for word in ("waiting", "stuck ·", "building", "validating", "done!", "just now", " ago",
+                         "captain's note", "a crewmate at work", "Secondmate of"):
+                self.assertNotIn(word, self.text(board))
+
+    def test_spanish_every_step_and_the_singular_header(self):
+        steps = {"review": "revisión", "test": "tests", "lint": "lint", "docs": "docs", "push": "push",
+                 "pr": "PR", "ci": "CI", "rebase": "rebase"}
+        summary = {"running": 0, "validating": 1, "needs_captain": 1, "problem": 0, "paused": 0, "done_recent": 0}
+        names = list(steps)
+        for group in (names[:4], names[4:]):
+            with self.subTest(steps=group):
+                feed = fleet([note(f"s{i}", "validating", f"job {step}", step=step) for i, step in enumerate(group)],
+                             summary)
+                board = self.render(None, feed, budget_ms=20_000, query="?speed=240&lang=es",
+                                    until=lambda b: len(self.segments(b)) >= len(group))
+                self.assertEqual(self.head(board), "FIRSTMATE 2 crewmates 1 espera")
+                text = self.text(board)
+                for step in group:
+                    self.assertIn(f"Lighthouse · job {step} validando · {steps[step]} · 18 min", text)
+        one = {"running": 1, "validating": 0, "needs_captain": 0, "problem": 1, "paused": 0, "done_recent": 0}
+        self.assertEqual(self.head(self.render(None, fleet([note("a1")], one), query="?lang=es")),
+                         "FIRSTMATE 2 crewmates 1 atascado")
+        one["problem"] = 0
+        self.assertEqual(self.head(self.render(None, fleet([note("a1")], one), query="?lang=es")),
+                         "FIRSTMATE 1 crewmate")
+
+    def test_spanish_secondmate_from_a_feed_built_by_fleetnotes(self):
+        def task(project):
+            return {"id": f"{project}-kumquat-onboarding", "kind": "ship", "project": f"/opt/fm/projects/{project}",
+                    "spawn_gen": f"s{NOW - 600}.1.2",
+                    "paths": {"status_log": {"last_event": {"age_seconds": 100}}},
+                    "current_state": {"state": "parked", "source": "pane", "freshness": "fresh"},
+                    "hints": {"pending_decision": True, "blocked_event": False}}
+
+        def snapshot(project, title):
+            return {"schema": "fm-fleet-snapshot.v1", "generated": ago(5), "tasks": [task(project)],
+                    "backlog": {"records": [{"id": f"{project}-kumquat-onboarding", "title": title}]}}
+
+        rules = parse_rules('project driftwood "Driftwood"\nproject tidepool "Tidepool"\n', "/opt/fm/rules.conf")
+        feed = build_feed(snapshot("tidepool", "New onboarding screens"), rules, b"s" * 32, now=NOW,
+                          extra=[Source("secondmate", snapshot("driftwood", "Slack integration"), "dw-mate"),
+                                 Source("remote", snapshot("tidepool", "Widget refresh"), "studio", "Studio Mac")]
+                          ).feed
+        self.assertIn(SECONDMATE_PREFIX + "Driftwood", [n["who"] for n in feed["notes"]])  # the feed stays English
+        full = lambda b: len(self.segments(b)) >= 3
+        spanish = self.text(self.render(None, feed, budget_ms=20_000, query="?lang=es", until=full))
+        self.assertIn("El secondmate de Driftwood · Slack integration espera al capitán · 1 min", spanish)
+        self.assertIn("Studio Mac: Tidepool · Widget refresh espera al capitán", spanish)
+        self.assertIn("Tidepool · New onboarding screens espera al capitán", spanish)
+        self.assertNotIn("Secondmate of", spanish)
+        english = self.text(self.render(None, feed, budget_ms=20_000, until=full))
+        self.assertIn("Secondmate of Driftwood · Slack integration waiting on the captain · 1 min", english)
+
+    def test_spanish_translates_only_the_feeds_secondmate_form(self):
+        feed = fleet([
+            note("a1", label="named like the prefix", project="Secondmate of Ab", who="Secondmate of Ab"),
+            note("a2", label="a machine with that name", project="Ab", who="Secondmate of: Ab"),
+            note("a3", label="a feed without who", project="Ab", who=None),
+        ])
+        del feed["notes"][2]["who"]
+        board = self.render(None, feed, budget_ms=20_000, query="?lang=es",
+                            until=lambda b: len(self.segments(b)) >= 3)
+        text = self.text(board)
+        self.assertIn("Secondmate of Ab · named like the prefix", text)
+        self.assertIn("Secondmate of: Ab · a machine with that name", text)
+        self.assertIn("Ab · a feed without who", text)
+        self.assertNotIn("El secondmate de", text)
+
+    def test_spanish_every_long_sentence_is_whole_on_one_line(self):
+        self.assertEqual(max(len(n["label"]) for n in LONG_ES), LABEL_MAX)
+        self.assertEqual(len(SECONDMATE_ES + "DriftwoodKitPls1"), WHO_MAX - 1)
+        for item in [*LONG_ES, WIDEST_ES]:
+            with self.subTest(key=item["key"]):
+                segs = self.assertTicker(self.render(None, fleet([item]), query="?lang=es"), left=HEAD_MAX)
+                who = item["who"].replace(SECONDMATE_PREFIX, SECONDMATE_ES, 1)
+                for s in segs:
+                    self.assertTrue(s["text"].startswith(f"{who} · {item['label']} "), s["text"])
+
+    def test_spanish_longest_captains_note_is_whole_on_one_line(self):
+        text = ("Hoy: notas adhesivas con frases enteras de cada tarea, de los secondmates y del "
+                "Studio Mac, sí")[:NOTE_MAX]
+        self.assertEqual(len(text), NOTE_MAX)
+        segs = self.assertTicker(self.render(pinned(text), query="?lang=es"))
+        self.assertEqual(segs[0]["text"], f"{text} nota del capitán")
+
+    def test_spanish_header_always_fits(self):
+        # Right edge of the widest line of the header, against the edge where the header clips.
+        edges = ("(() => { const h = document.getElementById('head'); "
+                 "return [Math.max(...[...h.children].map(c => c.offsetLeft + c.scrollWidth)), h.clientWidth]; })()")
+        big, bigger = 10 ** 17, 10 ** 18
+        cases = {
+            "the longest real one": ({"running": 90, "validating": 5, "needs_captain": 99, "problem": 99,
+                                      "paused": 5, "done_recent": 0},
+                                     "FIRSTMATE 298 crewmates 99 esperan 99 atascados"),
+            "huge counts": ({"running": 10 * big, "validating": 0, "needs_captain": big, "problem": big,
+                             "paused": 0, "done_recent": 0},
+                            f"FIRSTMATE {12 * big} crew {big} esperan {big} atascados"),
+            "counts too wide for the whole words": ({"running": bigger, "validating": 0, "needs_captain": bigger,
+                                                     "problem": bigger, "paused": 0, "done_recent": 0},
+                                                    f"FIRSTMATE {3 * bigger} crew {bigger} esp. {bigger} atasc."),
+        }
+        for name, (summary, expected) in cases.items():
+            with self.subTest(name):
+                board = self.render(None, fleet([note("a1"), note("a2")], summary), query="?lang=es",
+                                    probe=edges)
+                right, clip = self.probed
+                self.assertLessEqual(right, clip)               # nothing clipped inside the header
+                self.assertEqual(self.head(board), expected)
+                self.assertTicker(board, left=HEAD_MAX)
 
     def test_the_page_runs_on_the_test_clock(self):
         with Chrome(self.url, NOW * 1000) as chrome:
