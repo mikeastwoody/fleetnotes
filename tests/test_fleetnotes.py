@@ -27,9 +27,11 @@ import textwrap
 import time
 import unittest
 from collections import Counter
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import fleetnotes.fleet
 from fleetnotes.config import Remote
 from fleetnotes.fleet import (
     BLOCKED_LABEL, BLOCKED_PROJECT, DONE_OLD, FEED_KEYS, KINDS, LABEL_FROM, NO_CACHE_DIR, NOTE_KEYS,
@@ -600,6 +602,33 @@ class RefreshTest(unittest.TestCase):
         self.assertIsNone(refilter_feed(self.feed(), Rules(path="/srv/example/rules.conf"), SALT))
 
 
+class ViewTestClock:
+    """A test clock for reading a view: time passes only by the waits the reader makes in full.
+
+    A wait that runs out its seconds moves the clock by those seconds, however long the machine
+    really took; a wait that ends because the view ended costs nothing. Until ``started()`` (the
+    view really runs) the clock stands still, so a slow start of the shell does not count either.
+    """
+
+    def __init__(self, started=lambda: True):
+        self.now = 0.0
+        self.started = started
+        self.give_up = time.monotonic() + 60  # only turns a view that never starts into a failure
+
+    def monotonic(self):
+        return self.now
+
+    def wait(self, proc, seconds):
+        try:
+            return proc.communicate(timeout=seconds)[0]  # a real wait: the view runs meanwhile
+        except subprocess.TimeoutExpired:
+            if self.started():
+                self.now += seconds
+            elif time.monotonic() > self.give_up:
+                raise AssertionError("the view never started") from None
+            raise
+
+
 class SnapshotRunnerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -647,11 +676,19 @@ class SnapshotRunnerTest(unittest.TestCase):
     def test_timeout_and_stop_kill_the_view(self):
         marker = os.path.join(self.home, "child.pid")
         self.write_view(f"sleep 30 & echo $! > {marker}; wait\n")
-        start = time.monotonic()
-        with self.assertRaises(SnapshotError) as ctx:
-            run_snapshot(self.home, timeout=30, should_stop=lambda: time.monotonic() - start > 1)
+
+        def started():  # the view's shell has written its child's pid
+            try:
+                with open(marker) as f:
+                    return f.read().endswith("\n")
+            except FileNotFoundError:
+                return False
+        clock = ViewTestClock(started)
+        start = clock.monotonic()
+        with mock.patch.object(fleetnotes.fleet, "_clock", clock), self.assertRaises(SnapshotError) as ctx:
+            run_snapshot(self.home, timeout=30, should_stop=lambda: clock.monotonic() - start > 1)
         self.assertEqual(str(ctx.exception), "read interrupted")
-        self.assertLess(time.monotonic() - start, 5)
+        self.assertLess(clock.monotonic() - start, 5)
         with open(marker) as f:
             child = int(f.read())
         for _ in range(40):  # the killed, orphaned sleep is reaped by the system shortly after
@@ -663,11 +700,12 @@ class SnapshotRunnerTest(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(child, 0)
         self.write_view("sleep 30\n")
-        start = time.monotonic()
-        with self.assertRaises(SnapshotError) as ctx:
+        clock = ViewTestClock()
+        start = clock.monotonic()
+        with mock.patch.object(fleetnotes.fleet, "_clock", clock), self.assertRaises(SnapshotError) as ctx:
             run_snapshot(self.home, timeout=1)
         self.assertEqual(str(ctx.exception), "the view took longer than 1 s")
-        self.assertLess(time.monotonic() - start, 5)
+        self.assertLess(clock.monotonic() - start, 5)
 
 
 class TitleTest(unittest.TestCase):
