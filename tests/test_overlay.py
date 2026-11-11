@@ -1,12 +1,20 @@
 """Tests for the overlay (fleetnotes/overlay/fleetnotes.html, the news-ticker strip) in a real browser engine.
 
 Serves a copy of the overlay and fixture JSON files from a temp dir on
-127.0.0.1, loads it in headless Chrome (--dump-dom, own throwaway profile,
-every other host unresolvable so web fonts fail fast and nothing leaves the
-machine) and reads the board: the fixed fleet header and the ticker's
+127.0.0.1 and loads it in headless Chrome (own throwaway profile, every other
+host unresolvable so web fonts fail fast and nothing leaves the machine),
+driven over the DevTools protocol on a pipe. Before the overlay's script runs,
+the page gets a test clock (TEST_CLOCK, never part of the overlay): Date.now(),
+performance.now(), document.timeline and the timers all follow it, it starts
+at NOW, the instant every fixture is dated from, and it only moves when a test
+moves it, one timer at a time, each one once the page has finished the
+fetches and font loads it started. So the board after N ms of test time is the
+same on any machine, under any load and however long the suite has run.
+
+Then the tests read the board: the fixed fleet header and the ticker's
 segments, each with the moment it starts to enter on the right (data-start,
-animation clock in ms) and its width (data-w), so the tests can check the
-ticker has no gaps.
+animation clock in ms) and its width (data-w), so they can check the ticker
+has no gaps.
 
 Prefers CHROME_BIN, then puppeteer's chrome-headless-shell or Chrome for
 Testing, then an installed Chrome or Chromium; skipped when none is found.
@@ -17,15 +25,17 @@ Run from the repository root:
     python -m unittest discover -s tests -t . -v
 """
 
+import fcntl
 import functools
 import glob
 import html
 import json
 import os
 import re
+import select
 import shlex
 import shutil
-import subprocess
+import signal
 import sys
 import tempfile
 import threading
@@ -43,6 +53,8 @@ OVERLAY = overlay_path()
 BOARD_W = 948          # the ticker's window
 HEAD_MAX = 260         # widest fixed header
 CHROME_ARGS = shlex.split(os.environ.get("FLEETNOTES_CHROME_ARGS", ""))
+NOW = int(time.time())  # the instant the fixtures are dated from; the page's clock starts here
+CHROME_WAIT_S = 60      # safety net for one DevTools reply; the tests themselves never wait on real time
 
 
 def _newest(pattern: str) -> list[str]:
@@ -67,6 +79,249 @@ def find_chrome() -> str | None:
 
 
 CHROME = find_chrome()
+
+# The page's clock, installed by the DevTools protocol before any of the page's scripts. Test time
+# starts at 0 (Date.now() = EPOCH_MS) and moves only through step(), one timer at a time in order;
+# before and after each timer it waits until the fetches, body reads and font loads the page started
+# are over, so what the page does next depends on this clock alone. A timer's error is reported as a
+# browser would and the other timers still run.
+TEST_CLOCK = r"""
+(() => {
+  const EPOCH = EPOCH_MS, SETTLE_LIMIT_MS = 20000;
+  const RealDate = Date, realSetTimeout = setTimeout;
+  const timers = new Map();
+  let now = 0, order = 0, pending = 0;
+
+  function schedule(fn, delay, args, repeat) {
+    if (typeof fn !== 'function') throw new TypeError('test clock: a timer needs a function');
+    const id = ++order, wait = Math.max(0, Number(delay) || 0);
+    timers.set(id, { id, fn, args, due: now + wait, order: id, every: repeat ? Math.max(1, wait) : 0 });
+    return id;
+  }
+  class TestDate extends RealDate {
+    constructor(...args) { if (args.length) super(...args); else super(EPOCH + now); }
+    static now() { return EPOCH + now; }
+  }
+  function track(promise) {
+    pending++;
+    const done = () => { pending--; };
+    promise.then(done, done);
+    return promise;
+  }
+
+  // Resolves once nothing has been in flight for two task turns in a row (the page's await
+  // chains run in between); fails if the page is still waiting after SETTLE_LIMIT_MS of real time.
+  function settle() {
+    const deadline = RealDate.now() + SETTLE_LIMIT_MS;
+    return new Promise((resolve, reject) => {
+      let quiet = 0;
+      (function check() {
+        quiet = pending ? 0 : quiet + 1;
+        if (quiet >= 2) return resolve(now);
+        if (RealDate.now() > deadline) return reject(new Error('test clock: the page is still loading'));
+        realSetTimeout(check, pending ? 5 : 0);
+      })();
+    });
+  }
+
+  // Runs the next timer due by "limit" (ms of test time); with none left, moves the clock to "limit".
+  // Returns whether a timer ran.
+  async function step(limit) {
+    await settle();
+    let next = null;
+    for (const t of timers.values()) {
+      if (t.due <= limit && (!next || t.due < next.due || (t.due === next.due && t.order < next.order))) next = t;
+    }
+    if (!next) { now = Math.max(now, limit); return false; }
+    now = next.due;
+    if (next.every) { next.due += next.every; next.order = ++order; } else timers.delete(next.id);
+    try { next.fn(...next.args); } catch (e) { realSetTimeout(() => { throw e; }); }
+    await settle();
+    return true;
+  }
+
+  const realFetch = fetch.bind(window);
+  window.fetch = (...args) => track(realFetch(...args));
+  for (const name of ['json', 'text', 'arrayBuffer', 'blob']) {
+    const read = Response.prototype[name];
+    Response.prototype[name] = function (...args) { return track(read.apply(this, args)); };
+  }
+  const loadFont = FontFaceSet.prototype.load;
+  FontFaceSet.prototype.load = function (...args) { return track(loadFont.apply(this, args)); };
+  window.setTimeout = (fn, delay, ...args) => schedule(fn, delay, args, false);
+  window.setInterval = (fn, delay, ...args) => schedule(fn, delay, args, true);
+  window.clearTimeout = window.clearInterval = id => { timers.delete(id); };
+  window.Date = TestDate;
+  Object.defineProperty(performance, 'now', { value: () => now, configurable: true });
+  Object.defineProperty(document.timeline, 'currentTime', { get: () => now, configurable: true });
+  Object.defineProperty(window, '__testClock', { value: Object.freeze({ settle, step }) });
+})();
+"""
+# What the overlay may read time from: everything TEST_CLOCK drives.
+CLOCKED = {"Date.now", "Date.parse", "performance.now", "timeline.currentTime", "setTimeout", "setInterval",
+           "clearTimeout", "clearInterval"}
+TIME_SOURCES = re.compile(r"\bnew\s+Date\b|\bDate\.\w+|\bperformance\.\w+|\btimeline\.\w+|"
+                          r"\b(?:set|clear)(?:Timeout|Interval)\b|\brequest(?:AnimationFrame|IdleCallback)\b")
+
+
+def _high_fd(fd: int) -> int:
+    """A copy of ``fd`` numbered 10 or more and closed on exec: the child's dup2s cannot clobber it."""
+    high = fcntl.fcntl(fd, fcntl.F_DUPFD, 10)
+    os.set_inheritable(high, False)
+    return high
+
+
+class Chrome:
+    """One headless Chrome with one page on ``url``, driven over the DevTools protocol on a pipe (the
+    browser reads fd 3 and writes fd 4; each message is JSON ending in NUL). The page runs on TEST_CLOCK.
+    A context manager: closing it ends the browser, its helpers and its throwaway profile."""
+
+    def __init__(self, url: str, epoch_ms: int):
+        self.profile = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.stderr = tempfile.TemporaryFile()
+        self.buffer, self.events, self.last_id, self.session, self.pid = bytearray(), [], 0, None, None
+        to_chrome, self.write_fd = os.pipe()
+        self.read_fd, from_chrome = os.pipe()
+        devnull = os.open(os.devnull, os.O_RDWR)
+        fds = [_high_fd(fd) for fd in (devnull, self.stderr.fileno(), to_chrome, from_chrome)]
+        for fd in (devnull, to_chrome, from_chrome):
+            os.close(fd)
+        args = [CHROME, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+                "--disable-extensions", "--disable-background-networking", "--disable-component-update",
+                "--mute-audio", f"--user-data-dir={self.profile.name}",
+                "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1", *CHROME_ARGS,
+                "--remote-debugging-pipe", "about:blank"]
+        try:
+            try:
+                # Its own process group, so close() also ends the helpers it starts.
+                self.pid = os.posix_spawn(CHROME, args, os.environ, setpgroup=0, file_actions=[
+                    (os.POSIX_SPAWN_DUP2, fds[0], 0), (os.POSIX_SPAWN_DUP2, fds[0], 1),
+                    (os.POSIX_SPAWN_DUP2, fds[1], 2), (os.POSIX_SPAWN_DUP2, fds[2], 3),
+                    (os.POSIX_SPAWN_DUP2, fds[3], 4)])
+            finally:
+                for fd in fds:   # only the browser keeps its ends, so its exit reads as the pipe's end
+                    os.close(fd)
+            self._open(url, epoch_ms)
+        except BaseException:
+            self.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def _open(self, url, epoch_ms):
+        target = self.call("Target.createTarget", {"url": "about:blank"})["targetId"]
+        self.session = self.call("Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
+        self.call("Page.enable")
+        self.call("Page.setLifecycleEventsEnabled", {"enabled": True})
+        clock = TEST_CLOCK.replace("EPOCH_MS", str(epoch_ms))
+        self.call("Page.addScriptToEvaluateOnNewDocument", {"source": clock})
+        nav = self.call("Page.navigate", {"url": url})
+        if nav.get("errorText"):
+            raise RuntimeError(f"Chrome could not load the overlay: {nav['errorText']}")
+        self.wait_for("Page.lifecycleEvent",
+                      lambda p: p.get("name") == "load" and p.get("loaderId") == nav.get("loaderId"))
+
+    def _fail(self, why: str):
+        self.stderr.seek(0)
+        tail = self.stderr.read()[-2000:].decode(errors="replace")
+        raise RuntimeError(f"Chrome: {why}" + (f"\n{tail}" if tail else ""))
+
+    def _send(self, method, params=None) -> int:
+        self.last_id += 1
+        message = {"id": self.last_id, "method": method, "params": params or {}}
+        if self.session:
+            message["sessionId"] = self.session
+        data = json.dumps(message).encode() + b"\0"
+        try:
+            while data:
+                data = data[os.write(self.write_fd, data):]
+        except OSError as e:
+            self._fail(f"the DevTools pipe is closed ({e})")
+        return self.last_id
+
+    def _receive(self, deadline) -> dict:
+        while b"\0" not in self.buffer:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                self._fail(f"no answer in {CHROME_WAIT_S} s")
+            if select.select([self.read_fd], [], [], left)[0]:
+                chunk = os.read(self.read_fd, 1 << 16)
+                if not chunk:
+                    self._fail("the browser closed the DevTools pipe")
+                self.buffer += chunk
+        end = self.buffer.index(b"\0")
+        message = json.loads(self.buffer[:end])
+        del self.buffer[:end + 1]
+        return message
+
+    def call(self, method: str, params: dict | None = None) -> dict:
+        sent = self._send(method, params)
+        deadline = time.monotonic() + CHROME_WAIT_S
+        while True:
+            message = self._receive(deadline)
+            if message.get("id") == sent:
+                if "error" in message:
+                    self._fail(f"{method}: {message['error'].get('message')}")
+                return message.get("result", {})
+            if "method" in message:
+                self.events.append(message)
+
+    def wait_for(self, method: str, matches) -> dict:
+        deadline = time.monotonic() + CHROME_WAIT_S
+        while True:
+            for event in self.events:
+                if event["method"] == method and matches(event.get("params", {})):
+                    self.events.remove(event)
+                    return event["params"]
+            self.events.append(self._receive(deadline))
+
+    def evaluate(self, expression: str):
+        """The value of ``expression`` in the page, once its promise (if any) settles."""
+        result = self.call("Runtime.evaluate", {"expression": expression, "awaitPromise": True,
+                                                "returnByValue": True})
+        if "exceptionDetails" in result:
+            details = result["exceptionDetails"]
+            self._fail(details.get("exception", {}).get("description") or details.get("text", "error"))
+        return result["result"].get("value")
+
+    def html(self) -> str:
+        return self.evaluate("document.documentElement.outerHTML")
+
+    def run(self, limit_ms: int, until=None):
+        """Moves the page's clock to ``limit_ms`` of test time, one timer at a time. With ``until``, a
+        test of the page's HTML, it stops at the first moment the test holds instead."""
+        self.evaluate("__testClock.settle()")
+        while not (until and until(self.html())) and self.evaluate(f"__testClock.step({int(limit_ms)})"):
+            pass
+
+    def close(self):
+        if self.pid is not None:
+            self.session = None
+            try:
+                self._send("Browser.close")
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:   # the browser closes its end of the pipe as it exits
+                    if select.select([self.read_fd], [], [], deadline - time.monotonic())[0] \
+                            and not os.read(self.read_fd, 1 << 16):
+                        break
+            except (OSError, RuntimeError):
+                pass
+            try:
+                os.killpg(self.pid, signal.SIGKILL)   # any helper left; not yet reaped, the group is still ours
+            except (ProcessLookupError, PermissionError):
+                pass
+            os.waitpid(self.pid, 0)
+            self.pid = None
+        for fd in ("read_fd", "write_fd"):
+            if getattr(self, fd, None) is not None:
+                os.close(getattr(self, fd))
+                setattr(self, fd, None)
+        self.stderr.close()
+        self.profile.cleanup()
 
 
 class _QuietHandler(SimpleHTTPRequestHandler):
@@ -94,7 +349,7 @@ class _QuietHandler(SimpleHTTPRequestHandler):
 
 
 def ago(seconds: float) -> str:
-    return iso_utc(time.time() - seconds)
+    return iso_utc(NOW - seconds)
 
 
 def fleet(notes, summary=None, generated_ago=5):
@@ -133,6 +388,7 @@ LONG_SENTENCES = [f"{n['who']} · {n['label']}" for n in LONG]
 WIDEST = note("a6", "running", "FULL MIGRATION OF THE WIDGET AND LIVE ACTIVITY TO THE ISLE",
               project="HarborWatchAppXY", who="Studio Mac Spare: HarborWatchAppXY")
 
+BOARD = re.compile(r'<div class="board([^"]*)" id="board"([^>]*)>(.*?)</div>\s*<script>', re.S)
 SEGMENT = re.compile(r'<div class="seg"([^>]*)>(.*?)<div class="divider"></div></div>', re.S)
 
 
@@ -158,8 +414,10 @@ class OverlayTest(unittest.TestCase):
     def tearDown(self):
         _QuietHandler.sequences.clear()
 
-    def render(self, manual=None, feed=None, budget_ms=3000, query="") -> str:
-        """Inner HTML of the board after ``budget_ms`` of virtual time (first poll at 0)."""
+    def render(self, manual=None, feed=None, budget_ms=3000, query="", until=None) -> str:
+        """Inner HTML of the board after ``budget_ms`` of test time (first poll at 0). With ``until``, a
+        test of the board's inner HTML, it stops at the first moment the test holds instead, and
+        ``budget_ms`` is only the limit."""
         for name, data in ((MANUAL_FILENAME, manual), (FLEET_FILENAME, feed)):
             path = os.path.join(self.root, name)
             if data is None:
@@ -171,17 +429,16 @@ class OverlayTest(unittest.TestCase):
                         f.write(data)  # raw text: a broken file
                     else:
                         json.dump(data, f, ensure_ascii=False)
-        with tempfile.TemporaryDirectory() as profile:
-            out = subprocess.run(
-                [CHROME, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
-                 "--disable-extensions", "--disable-background-networking", "--disable-component-update",
-                 "--mute-audio", f"--user-data-dir={profile}",
-                 "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1", *CHROME_ARGS,
-                 f"--virtual-time-budget={budget_ms}", "--dump-dom", self.url + query],
-                capture_output=True, text=True, timeout=90,
-            ).stdout
-        match = re.search(r'<div class="board([^"]*)" id="board"([^>]*)>(.*?)</div>\s*<script>', out, re.S)
-        self.assertIsNotNone(match, "board not found in the dumped DOM")
+
+        def board_holds(page):
+            match = BOARD.search(page)
+            return bool(match and until(match.group(3)))
+
+        with Chrome(self.url + query, NOW * 1000) as chrome:
+            chrome.run(budget_ms, until and board_holds)
+            out = chrome.html()
+        match = BOARD.search(out)
+        self.assertIsNotNone(match, "board not found in the page")
         self.assertIn("ready", match.group(1))  # the first poll finished, whatever the data
         self.assertNotIn("�", match.group(3))
         self.filled = "filled" in match.group(1)
@@ -472,7 +729,9 @@ class OverlayTest(unittest.TestCase):
             note("a3", "running", "scouting job", kind="scout", started=120),
             note("a4", "validating", "checked job", step="test", position=2, total=3),
         ], {"running": 1, "validating": 1, "needs_captain": 0, "problem": 1, "paused": 0, "done_recent": 1})
-        board = self.render(None, feed)
+        # Each note is prepared 4 s before it enters, so when the fourth one is ready depends on how
+        # wide the font makes the first three: wait for the four of them, never past 20 s.
+        board = self.render(None, feed, budget_ms=20_000, until=lambda b: len(self.segments(b)) >= 4)
         self.assertEqual(self.head(board), "FIRSTMATE 3 crewmates 1 stuck")
         text = self.text(board)
         self.assertIn("Lighthouse · stuck job stuck · firstmate is on it", text)
@@ -508,18 +767,34 @@ class OverlayTest(unittest.TestCase):
     def test_renders_the_feed_built_from_a_snapshot(self):
         snapshot = {"schema": "fm-fleet-snapshot.v1", "generated": ago(5), "tasks": [{
             "id": "lh-kumquat-overlay", "kind": "ship", "project": "/opt/fm/projects/lighthouse",
-            "spawn_gen": f"s{int(time.time() - 1500)}.1.2",
+            "spawn_gen": f"s{NOW - 1500}.1.2",
             "paths": {"status_log": {"last_event": {"age_seconds": 400}}},
             "current_state": {"state": "working", "source": "pane", "freshness": "fresh"},
             "hints": {"pending_decision": False, "blocked_event": False}}],
             "backlog": {"records": [{"id": "lh-kumquat-overlay",
                                      "title": "Lighthouse: notes with concrete sentences (lh-kumquat-overlay)"}]}}
         rules = parse_rules('project lighthouse "Lighthouse"\n', "/opt/fm/rules.conf")
-        feed = build_feed(snapshot, rules, b"s" * 32).feed
+        feed = build_feed(snapshot, rules, b"s" * 32, now=NOW).feed
         board = self.render(None, feed)
         self.assertEqual(self.head(board), "FIRSTMATE 1 crewmate")
         self.assertIn("Lighthouse · notes with concrete sentences building · 25 min", self.text(board))
         self.assertNotIn("kumquat", self.text(board))
+
+    def test_the_page_runs_on_the_test_clock(self):
+        with Chrome(self.url, NOW * 1000) as chrome:
+            chrome.run(1234)
+            seen = chrome.evaluate("[Date.now(), new Date().getTime(), performance.now(), "
+                                   "document.timeline.currentTime]")
+            self.assertEqual(seen, [NOW * 1000 + 1234, NOW * 1000 + 1234, 1234, 1234])
+
+
+class OverlayClockTest(unittest.TestCase):
+    def test_the_overlay_reads_time_only_from_what_the_test_clock_drives(self):
+        with open(OVERLAY, encoding="utf-8") as f:
+            script = f.read().split("<script>", 1)[1]
+        used = set(TIME_SOURCES.findall(script))
+        self.assertIn("Date.now", used)
+        self.assertLessEqual(used, CLOCKED)
 
 
 if __name__ == "__main__":
